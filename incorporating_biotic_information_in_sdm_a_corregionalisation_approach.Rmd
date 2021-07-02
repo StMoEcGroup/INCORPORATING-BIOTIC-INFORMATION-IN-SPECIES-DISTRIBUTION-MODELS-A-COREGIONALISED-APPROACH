@@ -1,0 +1,1860 @@
+---
+title: "Incorporating-biotic-information-in-SDMs-a-coregionalised-approach"
+author: "Xavi Barber et al."
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+      toc: yes
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
+                      comment=" ", cache=FALSE )
+```
+
+
+```{r libraries}
+library(sp)
+library(rgeos)
+library(geoR)
+library(dismo)
+library(hSDM)
+library(rgdal)
+library(spdep)
+library(spData)
+library(fields)
+library(raster)
+library(maptools)
+library(gridExtra)
+library(ggplot2)
+library(rworldmap)
+library(rworldxtra)
+library(openxlsx)
+library(INLA)
+library(rgeos)
+library(GGally)
+library(ggplot2)
+library(ncdf4)
+library(corrplot)
+library(rasterVis)
+library( rnaturalearth)
+library(beepr)
+library(tidyverse)
+```
+
+# The dataset
+
+## Load data & maps
+
+```{r readData}
+ setwd("~/GSA06") ## server
+
+hake <- read.csv("Data/hake.csv", sep=";")
+sardina<-read.csv("Data/sardina.csv", sep=";")
+anxova<-read.csv("Data/anchoa.csv", sep=";")
+sardinella<-read.csv("Data/sardinella.csv", sep=";")
+
+
+kk1<-merge(hake, sardina, by=c("year","lon", "lat"))
+colnames(kk1)<-c("year" , "lon", "lat", "haul.hake" ,      "abun.hake" , "Bio.hake"  ,  "haul.sardina"  ,     "abun.sardina" ,"Bio.sardina")
+kk1.2<-merge(kk1, anxova, by=c("year","lon", "lat"))
+colnames(kk1.2)<-c("year" , "lon", "lat", "haul.hake" ,      "abun.hake" , "Bio.hake"  ,  "haul.sardina"  ,     "abun.sardina" ,"Bio.sardina", "haul.anxova", "abun.anxova", "Bio.anxova")
+kk1.3<-merge(kk1.2, sardinella, by=c("year","lon", "lat"))
+colnames(kk1.3)<-c("year" , "lon", "lat", "haul.hake" ,      "abun.hake" , "Bio.hake"  ,  "haul.sardina"  ,     "abun.sardina" ,"Bio.sardina", "haul.anxova", "abun.anxova", "Bio.anxova", "haul.sardinella"  ,     "abun.sardinella" ,"Bio.sardinella")
+
+sel<-c(7,10, 13)
+data<-(kk1.3[, -sel])
+
+```
+
+
+
+```{r create_coast}
+#coordinates
+coords<-data[, c("lon","lat")]
+### # --- Define the polygon # --- ###
+### # --- Spain # --- ###
+spain <- getData('GADM',country="ESP",level=0)
+france<-getData('GADM',country="FRA",level=0)
+andorra<-getData('GADM',country="AND",level=0)
+
+europe_1<-gUnion(andorra,france)
+
+#europe0<-gUnion(spain, andorra)
+
+europe<-gUnion(europe_1, spain)
+
+
+
+#plot(europe)
+### # --- Mediterraneo Español # --- ### we crop our study area from the entire map
+
+#ext<-extent(-2,4,35,44) #medidas anteriores
+ext<-extent(-1,4.5,37.5,max(coords[,2]))
+cat <- crop(europe, ext) #Only mediterranean
+# plot(cat)
+
+
+### # --- Define the polygon around the data # --- ###
+#we defina a polygon as our study area 
+xym<- as.matrix(data.frame(
+      x =c(min(coords[,1])-0.1, min(coords[,1])+0.8,
+                max(coords[,1])+ 0.8, max(coords[,1])/8), 
+      y = c(37.5,42.5, max(coords[,2])+0.1, min(coords[,2])-0.1))) 
+
+xym<- as.matrix(data.frame(
+      x =c(min(coords[,1]), min(coords[,1]),
+                max(coords[,1]), 1),# max(coords[,1])/8), 
+      y = c(37.5,max(coords[,2]), max(coords[,2]), min(coords[,2])))) 
+
+
+p = Polygon(xym)
+ps = Polygons(list(p),1)
+sps = SpatialPolygons(list(ps))
+
+#Crop with mediterranean
+cat_rec<-crop(cat, sps)
+proj4string(sps)<-proj4string(cat_rec)
+crs(sps) #check if previous command has been applied
+
+
+### # --- Select the polygon which contains the data # --- ###
+coast <- gDifference(sps, cat_rec )
+
+
+pointsInside<-SpatialPointsDataFrame(coords = data[,c("lon","lat")], data = data,
+                                proj4string = CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"))
+
+CRS.new<-CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0")
+
+proj4string(pointsInside) <- CRS.new 
+proj4string(coast) <- CRS.new
+
+data2<-data[!is.na(over(pointsInside, as(coast, "SpatialPolygons"))),]
+```
+
+## ploting dataset
+
+```{r beautiful_map , fig.width=10, fig.height=15}
+library("ggplot2")
+library("sf")
+library("rnaturalearth")
+library("rnaturalearthdata")
+library("ggspatial")
+
+theme_set(theme_bw())
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+data2$pres<-NA
+data2$pres<-ifelse( data2$abun.hake==0  ,
+                     0,data2$pres)
+
+data2$pres<-ifelse(  data2$abun.hake>0  &  data2$abun.anxova==0,
+                     1,data2$pres)
+
+data2$pres<-ifelse(  data2$abun.anxova>0  &  data2$abun.hake>0,
+                     2,data2$pres)
+
+
+data2$pres<-factor(data2$pres, labels=c("Absence Hake", "Only Hake", "Hake-Anchovies"))
+
+ggplot(data = world) +
+    geom_sf() +
+    annotation_scale(location = "br", width_hint = 0.5) +
+    annotation_north_arrow(location = "br", which_north = "true", 
+        pad_x = unit(0.75, "in"), pad_y = unit(0.5, "in"),
+        style = north_arrow_fancy_orienteering) +
+    coord_sf(xlim = c(ext@xmin, ext@xmax ), 
+             ylim = c(ext@ymin, ext@ymax))+
+  theme(panel.grid.major = element_line(color = gray(.5),
+                                        linetype = "dashed", size = 0.5),
+                                panel.background = element_rect(fill = "aliceblue"))+
+  xlab("Longitude") + ylab("Latitude") +
+  labs(col = "Hake-Anxovies")+
+  geom_point(data = data2, aes(x = lon, y = lat, color=pres))
+```
+
+
+
+```{r presence_by_species}
+### Building presence/ausence
+data2$anxova<-NA
+data2$anxova<-ifelse(data2$abun.anxova==0 & !is.na(data2$abun.anxov), 
+                     0,data2$anxova)
+
+data2$anxova<-ifelse(data2$abun.anxova>0 & !is.na(data2$abun.anxov), 
+                     1,data2$anxova)
+
+data2$hake<-NA
+data2$hake<-ifelse(data2$abun.hake ==0 & !is.na(data2$abun.hake), 
+                     0,data2$anxova)
+
+data2$hake<-ifelse(data2$abun.hake>0 & !is.na(data2$abun.hake), 
+                     1,data2$hake)
+
+
+```
+
+### Predictors
+
+```{r predictors1}
+# ################################# ################# ###################
+### # --- Environmental variables # --- ###
+# ################################# ################# ###################
+#opción 1
+
+library(sdmpredictors)
+
+listado<- list_layers(c("MARSPEC"))$layer_code
+predictors<-load_layers(listado[1])
+names(predictors)<-"Bathymetry"
+
+
+predictors<-crop(predictors, ext)
+predictors2<- -1*predictors#scale(predictors, scale=FALSE)
+#plot(predictors2)
+
+
+proj4string(predictors2)<-proj4string(cat_rec)
+
+# ################################################# ################# #################
+### # --- Create the datasets with the predictors # --- ###
+# ################################################# ################# #################
+data3<-NULL
+kk1<-as.matrix((data2[,2:3]), ncol=2)
+kk2<-raster::extract(predictors2, kk1)
+ data3<-cbind(data2,kk2) 
+```
+
+## The mesh (to improve?)
+
+```{r meshCreator, results='hide', fig.width=11, fig.height=15}
+### # --- Built the mesh # --- ###
+# ################ create a domain of the study area using inla.nonconvex.hull()
+library(INLA)
+#boundary=inla.nonconvex.hull(as.matrix(data[,2:3])) #the boundaries of our mesh are the boundaries of our lat and long data
+
+
+max.edge = diff(range(data3$lon))/15
+# - some chosen constant
+# - results should not be sensitive to this (if you have a good mesh)
+# - max.edge = diff(range(df$locx))/15
+bound.outer = diff(range(data3$lon))/3
+# - the outer boundary I want to use for my mesh
+# - some chosen constant
+# - results should not be sensitive to this
+# - bound.outer = diff(range(df$locx))/3
+
+mesh_xavi = inla.mesh.2d(loc=kk1, boundary=coast,
+                    max.edge = c(1,5)*max.edge,
+# - use 5 times max.edge in the outer extension/offset/boundary
+                    cutoff = max.edge/5,
+                    offset = c(max.edge, bound.outer), 
+                    crs=predictors2@crs)
+
+plot(mesh_xavi, main="")
+plot(europe, add=T, col="gray")
+points(data3$lon, data3$lat, pch=20, col=(as.numeric(data3$pres)+1))
+title("Contrained refined Delaunay triangulation (mesh) and sampling points")
+```
+
+```{r extreme-values}
+library(imputeTS)
+
+data3<-data3%>%mutate(abun.hake2=case_when(
+     abun.hake>=10000 ~ NA_real_,
+     TRUE ~ abun.hake
+))
+
+data3$temp<-ts(data3$abun.hake2)
+data3$abun.hake2<-imputeTS::na_random(data3$temp, lower_bound =2000, upper_bound = 15000)
+
+data3$abun.hake2<-as.numeric(data3$abun.hake2)
+#ggplot(data3, aes(x=lon, y=lat, col=log(abun.hake2)))+geom_point()
+#hist(data3$abun.hake2)
+
+#hist(data3$abun.hake2)
+#hist(data3$abun.hake)
+
+data3<-data3%>%mutate(abun.anxova2=case_when(
+     abun.anxova>=15000 ~ NA_real_,
+     TRUE ~ abun.anxova
+))
+
+
+data3$temp<-ts(data3$abun.anxova2)
+data3$abun.anxova2<-imputeTS::na_random(data3$temp, lower_bound =15000, upper_bound = 45000)
+
+data3$abun.anxova2<-as.numeric(data3$abun.anxova2)
+#ggplot(data3, aes(x=lon, y=lat, col=log(abun.anxova2)))+geom_point()
+#hist(data3$abun.anxova2)
+#hist(data3$abun.anxova)
+
+data3<-data3%>%mutate(abun.sardina2=case_when(
+     abun.sardina>=18000 ~ NA_real_,
+     TRUE ~ abun.sardina
+))
+```
+
+```{r mini-map-study-zone}
+ggplot(data = world) +
+     geom_sf() +
+     # annotation_scale(location = "br", width_hint = 0.5) +
+     # annotation_north_arrow(location = "br", which_north = "true", 
+     #     pad_x = unit(0.75, "in"), pad_y = unit(0.5, "in"),
+     #     style = north_arrow_fancy_orienteering) +
+   annotate("text", x=1, y=42, label="Mean=2779.5; sd=7653.6", color="blue")+
+      coord_sf(xlim = c(ext@xmin, ext@xmax ), 
+               ylim = c(ext@ymin, ext@ymax))+
+   theme(panel.grid.major = element_line(color = gray(.5),
+                                         linetype = "dashed", size = 0.5),
+                                       panel.background = element_rect(fill = "aliceblue"),
+         legend.position = "bottom" )+
+   xlab("Longitude") + ylab("Latitude") +
+   labs(size = "Anchovies:")+
+  geom_point(data = data2[data2$year==2015,], aes(x = lon, y = lat, size=(abun.anxova+0)), 
+             colour="blue", alpha=0.6)+
+  scale_size(breaks = c(0,1000,5000, 30000,45000), range = c(0,10))
+
+ggplot(data = world) +
+     geom_sf() +
+     # annotation_scale(location = "br", width_hint = 0.5) +
+     # annotation_north_arrow(location = "br", which_north = "true", 
+     #     pad_x = unit(0.75, "in"), pad_y = unit(0.5, "in"),
+     #     style = north_arrow_fancy_orienteering) +
+   annotate("text", x=1, y=42, label="Mean=1901.4; sd=2734.4", color="red")+
+      coord_sf(xlim = c(ext@xmin, ext@xmax ), 
+               ylim = c(ext@ymin, ext@ymax))+
+   theme(panel.grid.major = element_line(color = gray(.5),
+                                         linetype = "dashed", size = 0.5),
+                                       panel.background = element_rect(fill = "aliceblue"),
+         legend.position = "bottom" )+
+   xlab("Longitude") + ylab("Latitude") +
+   labs(size = "Hake:")+
+  geom_point(data = data2[data2$year==2015,], aes(x = lon, y = lat, size=(abun.hake+0)), colour="red", alpha=0.6)+
+  scale_size(breaks = c(0,1000,4000, 8000,14000), range = c(0,10))
+```
+
+
+# Hake Univariate
+
+```{r hake-univarite}
+sele<-data3$abun.hake2>=0  & 
+  data3$year>=2000 & data3$year<=2015 
+
+data2010<-data3[sele,]
+
+#min(data3$abun.hake2[data3$abun.hake2>0])
+#[1] 8.073275
+
+y1<-log((data2010$abun.hake2) + 8.073275/2)
+
+batimetria3<-data2010$Bathymetry #(data2010$Bathymetry , scale=F) 
+batimetria2<-batimetria3
+batimetria1<-batimetria3
+
+
+spde_corre <- inla.spde2.pcmatern(mesh = mesh_xavi, 
+  prior.range = c(0.05, 0.025), # P(range < 0.05) = 0.01
+  prior.sigma = c(3, 0.025),
+  constr = T) # P(sigma > 1) = 0.01
+
+
+X<-data2010$lon
+Y<-data2010$lat
+
+loc2<-cbind(X,Y)
+
+
+## # --# --pcopy# ################################---
+#hyper <- list(theta = list(prior = 'normal', param = c(0, 5)))
+hyper1 = list(theta = list(prior="pc.prec", param=c(1,0.01)))
+
+## # --# --form# ################################--# --
+form <- y ~ 0 + intercept1 + 
+#  f(batimetria1, model="rw2", constr = FALSE) +
+  batimetria1+
+  f(s1, model = spde_corre) 
+  
+
+## --# --# ---
+
+A <- inla.spde.make.A(mesh_xavi, loc2) 
+
+
+
+stack1 <- inla.stack(
+  data = list(y =  as.vector(y1), link=1),
+  A = list(A,1), 
+  effects = list(list(s1 = 1:spde_corre$n.spde),
+                  data.frame(intercept1 = 1, batimetria1=batimetria1)),
+  tag="est.hake.uni")
+
+
+
+result_uni2000_hake<- inla(form, 'gaussian',
+                       data = inla.stack.data(stack1),
+                    #  control.family = list(link = "log"),
+                       #  control.family = list(hyper.eps, hyper.eps),
+                       # control.family=list(list(link="logit"),list(link="logit")),
+                       control.predictor = list(A = inla.stack.A(stack1),
+                                                compute = TRUE,link=1),
+                   #    control.mode = list(theta =result_corre2010$mode$theta, restart = TRUE),
+                      control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,    config = TRUE),
+                       control.results = list(return.marginals.predictor = FALSE,
+                                              return.marginals.random = FALSE),
+                      control.inla = list(strategy="gaussian", int.strategy = 'ccd'),
+                       num.threads = 3,
+                       verbose=FALSE)
+
+saveRDS(result_uni2000_hake, file="result_uni2000_hake.RDS")
+result_uni2000_hake<-readRDS(file="result_uni2000_hake.RDS")
+
+#summary(result_corre2000)
+
+knitr::kable(result_uni2000_hake$summary.fixed[,1:5],
+  row.names = TRUE,
+  caption = "Hake: Posterior distribution for Fixed Effects (Univariate 2000-2017).",
+   format = "latex")
+
+knitr::kable(result_uni2000_hake$summary.hyperpar[,1:5], digits=3,
+  row.names = TRUE,
+  caption = "Hake: Posterior distributions of the parameters of the spatial fields (Univariate 2000-2017).",
+   format = "latex")
+```
+
+
+### Spatial effect
+
+```{r spatial_effect_uni_hake}
+# ################################################# ################# ################
+### # --- Interpolate the posterior mean and sd # --- ##
+# ################################################# ################# ################
+### # --- plot in a grid m X m # --- ##
+
+### # --- Customize the grid to predict # --- ###
+#now we are going to remove the part of the mesh that was inside the coast
+layout(1,1)
+#bbox(coast)
+dxy <- apply(bbox(coast),1, diff)
+r <- dxy[1]/dxy[2]
+m<-150
+proj.grid.mat <- 
+  inla.mesh.projector(mesh_xavi, 
+                      xlim=bbox(coast)[1,],
+                      ylim=bbox(coast)[2,] ,
+                      dims=c(r, 1)*m)
+
+
+### # --- clean (set NA to the values outside boundary) # --- ###
+ov <- over(SpatialPoints(proj.grid.mat$lattice$loc, coast@proj4string),
+           coast)
+
+### # --- check grid points inside the map # --- ###
+i.map <- is.na(ov)
+
+
+
+
+```
+
+
+## Prediction
+
+```{r prediction-univariate-hake-1}
+A1.pred <- inla.spde.make.A(mesh_xavi, loc=proj.grid.mat$lattice$loc[!i.map, ])
+
+
+bathy.pred<-raster::extract(predictors2$Bathymetry,  proj.grid.mat$lattice$loc[!i.map, ]) 
+
+bathy.pred2<-raster::extract(predictors2$Bathymetry, mesh_xavi$loc[, 1:2])
+
+saveRDS(bathy.pred2, file="bathy_into_mesh_points.RDS")
+saveRDS(mesh_xavi, file="mesh_xavi.RDS")
+
+nY<-table(!i.map)[2]
+
+stk.pred.1 <- inla.stack(data=list(y=matrix(NA, ncol=1, nrow=nY), link=2), 
+                         #  ,, 
+                         A=list(A1.pred,1), 
+                         effects = list(list(s1 = 1:spde_corre$n.spde),
+                                        data.frame(intercept1=rep(1,nY), 
+                                                   batimetria1=bathy.pred)),
+                         tag='pred.y1.uni')
+
+
+stack_all.pred <- inla.stack( stack1,# stack3,  
+                        stk.pred.1)#, stk.pred.3) 
+
+pred_univariate_2000_2017_hake<- inla(form, 'gaussian',
+                       data = inla.stack.data(stack_all.pred),
+                     #  control.family = list(link = "log"),
+                       #  control.family = list(hyper.eps, hyper.eps),
+                       # control.family=list(list(link="logit"),list(link="logit")),
+                       control.predictor = list(A = inla.stack.A(stack_all.pred),
+                                                compute = TRUE,link=1),
+                       control.mode = list(theta =result_uni2000_hake$mode$theta, restart = TRUE),
+                    #   control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,    config = TRUE),
+
+                       control.results = list(return.marginals.predictor = FALSE,
+                                              return.marginals.random = FALSE),
+                      control.inla = list(strategy="gaussian", int.strategy = 'ccd'),
+                       num.threads = 3,
+                       verbose=FALSE)
+
+saveRDS(pred_univariate_2000_2017_hake, file="pred_univariate_2000_2017_hake.RDS")
+pred_univariate_2000_2017_hake<-readRDS(file="pred_univariate_2000_2017_hake.RDS")
+```
+
+### Hake spatial effect
+
+```{r hake-spatial-effect-uni}
+
+idx.y2 <- inla.stack.index(stack_all.pred, 'pred.y1.uni')$data  
+
+spatial.effect<-inla.mesh.project(proj.grid.mat,
+                                  pred_univariate_2000_2017_hake$summary.random$s1$mean)
+
+
+## plot spatial effect
+image.plot(proj.grid.mat$x, 
+           proj.grid.mat$y,
+          spatial.effect, 
+           axes=TRUE, xlab=("Longitude"), ylab="Latitude"  ,
+           col= tim.colors(100), horizontal = T) #, zlim=c(-15,15))#,
+          # breaks = breaks)
+plot(europe, add=TRUE,col="bisque4")
+title(" mean spatial effect Hake (univariate)")
+box()
+
+```
+
+### Hake: Prediction Plot Univariate 
+
+```{r plot_pred_uni_hake}
+
+idx.y2 <- inla.stack.index(stack_all.pred, 'pred.y1.uni')$data  
+
+
+prob.mean.y1 <- prob.sd.y1 <- prob.0.025.y1<- prob.0.975.y1 <- matrix(NA, proj.grid.mat$lattice$dims[1],
+                                                          proj.grid.mat$lattice$dims[2])
+prob.mean.y1[!i.map] <- (c(pred_univariate_2000_2017_hake$summary.fitted.val$mean[idx.y2]))
+prob.sd.y1[!i.map] <- c(pred_univariate_2000_2017_hake$summary.fitted.val$sd[idx.y2])
+prob.0.025.y1[!i.map] <- c(pred_univariate_2000_2017_hake$summary.fitted.val$`0.025quant`[idx.y2])
+prob.0.975.y1[!i.map] <- c(pred_univariate_2000_2017_hake$summary.fitted.val$`0.975quant`[idx.y2])
+
+
+library(RColorBrewer)
+#par(mfrow=c(2,2))
+#par(mar=c(2,3,3,6))
+
+
+rf <- colorRampPalette(rev(brewer.pal(11,'Spectral')))   # make colors
+colores1 <-rf(10) #rf(length(breaks1)-1)
+
+# ***** trick to remove
+prob.mean.y1[!i.map]<-ifelse(prob.mean.y1[!i.map]>1.25*max(y1),max(y1), prob.mean.y1[!i.map] )
+# *********************
+#maximo<- 15 #max(prob.mean.y2, na.rm=T)
+#minimo<-(-15) #min(prob.mean.y2, na.rm=T)
+#particion<-2#maximo/200
+#breaks <- seq(minimo, maximo , particion)
+
+image.plot(proj.grid.mat$x, 
+           proj.grid.mat$y,
+          log(prob.mean.y1), 
+           axes=TRUE, xlab=("Longitude"), ylab="Latitude"  ,
+           col= tim.colors(100), horizontal = T) #, zlim=c(0, 2000000))#,
+          # breaks = breaks)
+plot(europe, add=TRUE,col="bisque4")
+title(" Hake (univariate)")
+box()
+```
+
+
+# Anxovies Abundance  (univariate)
+
+## Inference: $Y_i \sim Gamma(\alpha, \beta)$
+
+```{r anxovies-univariate-1}
+
+
+sele<-  data3$abun.anxova2>=0  &
+    data3$year>=2000 & data3$year<=2015 
+
+
+data2010<-data3[sele,]
+
+#min(data2010$abun.anxova2[data2010$abun.anxova2>0])
+# 17.82389
+
+y2<-log((data2010$abun.anxova2) + 17.82389/2) #+1)
+
+batimetria3<-data2010$Bathymetry #scale(data2010$Bathymetry , scale=F) 
+batimetria2<-batimetria3
+
+spde_corre <- inla.spde2.pcmatern(mesh = mesh_xavi, 
+  prior.range = c(0.05, 0.025), # P(range < 0.05) = 0.01
+  prior.sigma = c(10, 0.025),
+  constr = T) # P(sigma > 1) = 0.01
+
+X<-data2010$lon
+Y<-data2010$lat
+
+loc2<-cbind(X,Y)
+
+## # --# --pcopy# ################################---
+hyper <- list(theta = list(prior = 'normal', param = c(0, 5)))
+#hyper1 = list(theta = list(prior="pc.prec", param=c(1,0.01)))
+
+## # --# --form# ################################--# --
+form <- y ~ 0 + intercept2 + 
+ # f(batimetria2, model="rw1", constr=TRUE)+
+  batimetria2+
+  f(s2, model = spde_corre) 
+## --# --# ---
+
+A <- inla.spde.make.A(mesh_xavi, loc2) 
+
+stack2 <- inla.stack(
+  data = list(y =  as.vector(y2), link=1),
+  A = list(A,1), 
+  effects = list(list(s2 = 1:spde_corre$n.spde,
+                      s12 = 1:spde_corre$n.spde),
+                  data.frame(intercept2 = 1, batimetria2=batimetria2)),
+  tag="est.anxova.uni")
+
+result_uni2000<- inla(form, 'gamma', # 'gaussian' #'lognormal'
+                       data = inla.stack.data(stack2),
+                    #  control.family = list(link = "log"),
+                       #  control.family = list(hyper.eps, hyper.eps),
+                       # control.family=list(list(link="logit"),list(link="logit")),
+                       control.predictor = list(A = inla.stack.A(stack2),
+                                                compute = TRUE,link=1),
+                   #    control.mode = list(theta =result_corre2010$mode$theta, restart = TRUE),
+                      control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,    config = TRUE),
+
+                       control.results = list(return.marginals.predictor = FALSE,
+                                              return.marginals.random = FALSE),
+                      control.inla = list(strategy='laplace', int.strategy = 'ccd'),
+                       num.threads = 3,
+                       verbose=FALSE)
+
+
+saveRDS(result_uni2000, file="result_uni2000.RDS")
+result_uni2000<-readRDS(file="result_uni2000.RDS")
+
+#summary(result_corre2000)
+
+knitr::kable(result_uni2000$summary.fixed[,1:5],
+  row.names = TRUE,
+  caption = "Anchovies: Posterior distribution for Fixed Effects (Univariate 2000-2017).",
+   format = "latex")
+
+knitr::kable(result_uni2000$summary.hyperpar[,1:5], digits=3,
+  row.names = TRUE,
+  caption = "Anchovies: Posterior distributions of the parameters of the spatial fields (Univariate 2000-2017).",
+   format = "latex")
+```
+
+
+### Anchovies: Spatial effect
+
+```{r spatial_effect_uni_anchovie}
+# ################################################# ################# ################
+### # --- Interpolate the posterior mean and sd # --- ##
+# ################################################# ################# ################
+### # --- plot in a grid m X m # --- ##
+
+### # --- Customize the grid to predict # --- ###
+#now we are going to remove the part of the mesh that was inside the coast
+layout(1,1)
+#bbox(coast)
+dxy <- apply(bbox(coast),1, diff)
+r <- dxy[1]/dxy[2]
+m<-150
+proj.grid.mat <- 
+  inla.mesh.projector(mesh_xavi, 
+                      xlim=bbox(coast)[1,],
+                      ylim=bbox(coast)[2,] ,
+                      dims=c(r, 1)*m)
+
+
+### # --- clean (set NA to the values outside boundary) # --- ###
+ov <- over(SpatialPoints(proj.grid.mat$lattice$loc, coast@proj4string),
+           coast)
+
+### # --- check grid points inside the map # --- ###
+i.map <- is.na(ov)
+```
+
+
+## Anchovies: Prediction
+
+```{r prediction-univariate-anxovies-1}
+
+A2.pred <- inla.spde.make.A(mesh_xavi, loc=proj.grid.mat$lattice$loc[!i.map, ])
+
+
+bathy.pred<-raster::extract(predictors2$Bathymetry,  proj.grid.mat$lattice$loc[!i.map, ]) 
+bathy.pred2<-raster::extract(predictors2$Bathymetry, mesh_xavi$loc[, 1:2])
+
+bathy.pred<-bathy.pred#scale(bathy.pred, scale=FALSE)
+
+nY<-table(!i.map)[2]
+
+stk.pred.2 <- inla.stack(data=list(y=matrix(NA, ncol=1, nrow=nY), link=2), 
+                         #  ,, 
+                         A=list(A2.pred,1), 
+                         effects = list(list(s2 = 1:spde_corre$n.spde,
+                                             s12 = 1:spde_corre$n.spde),
+                                        data.frame(intercept2=rep(1,nY), 
+                                                   batimetria2=bathy.pred)),
+                         tag='pred.y2.uni')
+
+stack_all.pred <- inla.stack( stack2,# stack3,  
+                        stk.pred.2)#, stk.pred.3) 
+
+pred_univariate_2000_2017<- inla(form, 'gamma', # 'gaussian' #'lognormal'
+                       data = inla.stack.data(stack_all.pred),
+                       control.family = list(link = "log"),
+                       #  control.family = list(hyper.eps, hyper.eps),
+                       # control.family=list(list(link="logit"),list(link="logit")),
+                       control.predictor = list(A = inla.stack.A(stack_all.pred),
+                                                compute = TRUE,link=1),
+                       control.mode = list(theta =result_uni2000$mode$theta, restart = TRUE),
+                    #   control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,    config = TRUE),
+
+                       control.results = list(return.marginals.predictor = FALSE,
+                                              return.marginals.random = FALSE),
+                      control.inla = list(strategy='laplace',int.strategy = 'ccd'),
+                       num.threads = 3,
+                       verbose=FALSE)
+# beep(0)
+# beep("fanfare")
+# beep(8)
+
+saveRDS(pred_univariate_2000_2017, file="pred_univariate_2000_2017.RDS")
+pred_univariate_2000_2017<-readRDS(file="pred_univariate_2000_2017.RDS")
+```
+
+### Anchovies: spatial effect
+
+```{r anchovies-spatial-effect}
+
+idx.y2 <- inla.stack.index(stack_all.pred, 'pred.y2.uni')$data  
+
+spatial.effect<-inla.mesh.project(proj.grid.mat,
+                                  pred_univariate_2000_2017$summary.random$s2$mean)
+
+## plot spatial effect
+image.plot(proj.grid.mat$x, 
+           proj.grid.mat$y,
+          ( spatial.effect), 
+           axes=TRUE, xlab=("Longitude"), ylab="Latitude"  ,
+           col= tim.colors(100), horizontal = T) #, zlim=c(-15,15))#,
+          # breaks = breaks)
+plot(europe, add=TRUE,col="bisque4")
+title("Spatial effect Anxovies (univariate)")
+box()
+
+```
+
+### Prediction Plot Univariate Anchovies
+
+```{r plot-pred-anchovies-uni}
+
+idx.y2 <- inla.stack.index(stack_all.pred, 'pred.y2.uni')$data  
+
+prob.mean.y2 <- prob.sd.y2 <- prob.0.025.y2<- prob.0.975.y2 <- matrix(NA, proj.grid.mat$lattice$dims[1],
+                                                          proj.grid.mat$lattice$dims[2])
+prob.mean.y2[!i.map] <- (c(pred_univariate_2000_2017$summary.fitted.val$mean[idx.y2]))
+prob.sd.y2[!i.map] <- c(pred_univariate_2000_2017$summary.fitted.val$sd[idx.y2])
+prob.0.025.y2[!i.map] <- c(pred_univariate_2000_2017$summary.fitted.val$`0.025quant`[idx.y2])
+prob.0.975.y2[!i.map] <- c(pred_univariate_2000_2017$summary.fitted.val$`0.975quant`[idx.y2])
+
+
+
+library(RColorBrewer)
+
+rf <- colorRampPalette(rev(brewer.pal(11,'Spectral')))   # make colors
+colores1 <-rf(10) #rf(length(breaks1)-1)
+
+maximo<- 12 #max(prob.mean.y2[!i.map], na.rm=T)
+minimo<-(-5) #min(log(prob.mean.y2[!i.map]), na.rm=T)
+particion<-2#maximo/200
+breaks <- seq(minimo, maximo , particion)
+
+
+image.plot(proj.grid.mat$x, 
+           proj.grid.mat$y,
+          log(prob.mean.y2), 
+           axes=TRUE, xlab=("Longitude"), ylab="Latitude"  ,
+           col= tim.colors(100), horizontal = T ,zlim=c(minimo, maximo))#,
+          # breaks = breaks)
+plot(europe, add=TRUE,col="bisque4")
+title(" Anxovies (univariates)")
+box()
+
+prediction.anchovies.univariate<-prob.mean.y2
+
+
+```
+
+
+# Coregionalization Anchovies|Hake
+
+## Inference 
+
+Generic expression of coregionalization  (only with INLA, not Gelfand  approach):
+
+$$y_1(s)=\beta_0^1+ \beta_1^1 \times Bathy + w_1(s)+ e_1(s)$$
+$$y_2(s)= \beta_0^2+ \beta_1^2 \times Bathy + \alpha_{2|1} w_1(s) + w_2(s)+ e_2(s)$$
+
+
+```{r corre-1-anchovies}
+sele1<-data3$abun.hake2>=0 &  
+    data3$year>=2000 & data3$year<=2015 
+
+
+sele2<-data3$abun.anxova2>=0  &
+    data3$year>=2000 & data3$year<=2015 
+
+
+data2010<-data3[sele,]
+
+y1<-log(data3[sele1,"abun.hake2"]+4) 
+y2<-log(data3[sele2,"abun.anxova2"]+9) 
+
+batimetria2<- data3[sele2,"Bathymetry" ]
+batimetria1<-data3[sele1,"Bathymetry" ]
+
+
+spde_corre <- inla.spde2.pcmatern(mesh = mesh_xavi, 
+  prior.range = c(0.1, 0.025), # P(range < 0.05) = 0.01
+  prior.sigma = c(3, 0.025),
+  constr = T) # P(sigma > 1) = 0.01
+
+
+
+loc2<-cbind(data3$lon[sele2], data3$lat[sele2])
+loc1<-cbind(data3$lon[sele1], data3$lat[sele1])
+
+## # --# --pcopy# ################################---
+#hyper <- list(theta = list(prior = 'normal', param = c(0, 5)))
+hyper1 = list(theta = list(prior="pc.prec", param=c(1,0.01)))
+
+## # --# --form# ################################--# --
+form <- y ~ 0 + intercept1 + intercept2 + 
+ # f(batimetria1, model="rw1")+f(batimetria2, model="rw1")+
+  batimetria1+batimetria2+
+  f(s1, model = spde_corre) + f(s2, model = spde_corre) + 
+  f(s12, copy = "s1", fixed = FALSE, hyper = hyper) 
+
+
+## --# --# ---
+
+A1 <- inla.spde.make.A(mesh_xavi, loc1)  # abun.hake>0
+A2 <- inla.spde.make.A(mesh_xavi, loc2)  # abun.anchovies>0
+
+
+stack2 <- inla.stack(
+  data = list(y = cbind(NA, as.vector(y2)), link=2),
+  A = list(A2,1), 
+  effects = list(list(s2 = 1:spde_corre$n.spde,
+                      s12 = 1:spde_corre$n.spde),
+                  data.frame(intercept2 = 1, batimetria2=batimetria2)),
+  tag="est.anxova.corre")
+
+stack1 <- inla.stack(
+  data = list(y = cbind(as.vector(y1), NA), link=1),
+  A = list(A1,1), 
+  effects = list(list(s1 = 1:spde_corre$n.spde),
+                  data.frame(intercept1 = 1, batimetria1=batimetria1)),
+  tag="est.hake.corre")
+
+
+stack <- inla.stack(stack1, stack2) 
+
+## --# --result, results = 'hide'# ################################# --# --
+
+
+result_corre2000<- inla(form, c(rep('gamma', 2)),  # 'gaussian' #'lognormal'
+                       data = inla.stack.data(stack),
+                      #   control.family = list(list(link = "log"),
+                      #                         list(link = "log")),
+
+                       control.predictor = list(A = inla.stack.A(stack),
+                                                compute = TRUE,link=1),
+                   #    control.mode = list(theta =result_corre2010$mode$theta, restart = TRUE),
+                      control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,    config = TRUE),
+
+                       control.results = list(return.marginals.predictor = FALSE,
+                                              return.marginals.random = FALSE),
+                      control.inla = list(
+                        strategy='laplace',
+                        int.strategy = 'ccd'),
+                       num.threads = 3,
+                       verbose=FALSE)
+
+ beep(0)
+# beep("fanfare")
+# beep(8)
+
+saveRDS(result_corre2000, file="result_corre2000.RDS")
+result_corre2000<-readRDS(file="result_corre2000.RDS")
+
+#summary(result_corre2000)
+
+knitr::kable(result_corre2000$summary.fixed[,1:5],
+  row.names = TRUE,
+  caption = "Posterior distribution for Fixed Effects (Coregionalization 2000-2017).",
+   format = "latex")
+
+knitr::kable(result_corre2000$summary.hyperpar[,1:5], digits=3,
+  row.names = TRUE,
+  caption = "Posterior distributions of the parameters of the spatial fields (Coregionalization 2000-2017).",
+   format = "latex")
+```
+
+
+```{r spatial-effect-corre-anchovies}
+# ################################################# ################# ################
+### # --- Interpolate the posterior mean and sd # --- ##
+# ################################################# ################# ################
+### # --- plot in a grid m X m # --- ##
+
+### # --- Customize the grid to predict # --- ###
+#now we are going to remove the part of the mesh that was inside the coast
+layout(1,1)
+#bbox(coast)
+dxy <- apply(bbox(coast),1, diff)
+r <- dxy[1]/dxy[2]
+m<-150
+proj.grid.mat <- 
+  inla.mesh.projector(mesh_xavi, 
+                      xlim=bbox(coast)[1,],
+                      ylim=bbox(coast)[2,] ,
+                      dims=c(r, 1)*m)
+
+
+### # --- clean (set NA to the values outside boundary) # --- ###
+ov <- over(SpatialPoints(proj.grid.mat$lattice$loc, coast@proj4string),
+           coast)
+
+### # --- check grid points inside the map # --- ###
+i.map <- is.na(ov)
+
+
+```
+
+
+
+## Prediction
+
+
+```{r corre-pred-anchovies}
+A1.pred <- inla.spde.make.A(mesh_xavi, loc=proj.grid.mat$lattice$loc[!i.map, ])
+A2.pred <- inla.spde.make.A(mesh_xavi, loc=proj.grid.mat$lattice$loc[!i.map, ])
+
+bathy.pred<-raster::extract(predictors2$Bathymetry,  proj.grid.mat$lattice$loc[!i.map, ]) 
+
+nY<-table(!i.map)[2]
+
+stk.pred.1 <- inla.stack(data=list(y=matrix(NA, ncol=2, nrow=nY ), link=1), 
+                         A=list(A1.pred,1), 
+                         effects = list(list(s1 = 1:spde_corre$n.spde),
+                                        data.frame(intercept1=rep(1,nY), batimetria2=bathy.pred)),
+                         tag='pred.y1.corre')
+
+stk.pred.2 <- inla.stack(data=list(y=matrix(NA, ncol=2, nrow=nY), link=2), 
+                         #  ,, 
+                         A=list(A2.pred,1), 
+                         effects = list(list(s2 = 1:spde_corre$n.spde,
+                                             s12 = 1:spde_corre$n.spde),
+                                        data.frame(intercept2=rep(1,nY), batimetria2=bathy.pred)),
+                         tag='pred.y2.corre')
+
+
+
+
+stack_all <- inla.stack(stack1, stack2,# stack3,  
+                        stk.pred.1, stk.pred.2)#, stk.pred.3) 
+
+pred_corre_2012_2017<- inla(form, c(rep('gamma', 2)),  # 'gaussian' #'lognormal'
+                       data = inla.stack.data(stack_all),
+                           control.family = list(list(link = "log"),
+                                                list(link = "log")),
+                       #  control.family = list(hyper.eps, hyper.eps),
+                       # control.family=list(list(link="logit"),list(link="logit")),
+                       control.predictor = list(A = inla.stack.A(stack_all),
+                                                compute = TRUE,link=1),
+                       control.mode = list(theta =result_corre2000$mode$theta, restart = TRUE),
+                    #   control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,    config = TRUE),
+                       control.results = list(return.marginals.predictor = FALSE,
+                                              return.marginals.random = FALSE),
+                       control.inla = list(
+                         strategy='gaussian',
+                          int.strategy = 'ccd'),
+                          #  strategy='gaussian',
+                          # int.strategy = 'eb'),
+                      # num.threads = 3,
+                       verbose=FALSE)
+ beep(0)
+# beep("fanfare")
+# beep(8)
+
+saveRDS(pred_corre_2012_2017, file="pred_corre_2012_2017.RDS")
+pred_corre_2012_2017<-readRDS(file="pred_corre_2012_2017.RDS")
+
+```
+
+
+### spatial effect
+
+
+```{r spatial-effect-anchovies-corre}
+
+idx.y2 <- inla.stack.index(stack_all, 'pred.y2.corre')$data  
+
+
+spatial.effect.corre<-inla.mesh.project(proj.grid.mat,
+                                  pred_corre_2012_2017$summary.random$s2$mean)
+
+spatial.effect.corre12<-spatial.effect.corre+
+                inla.mesh.project(proj.grid.mat,
+                                  pred_corre_2012_2017$summary.random$s12$mean)
+
+# spatial.effect.corre  <- matrix(NA, proj.grid.mat$lattice$dims[1],proj.grid.mat$lattice$dims[2])
+# spatial.effect.corre[!i.map]<-pred_corre_2012_2017$summary.linear.predictor[idx.y2 , "mean"]
+
+## plot spatial effect
+image.plot(proj.grid.mat$x, 
+           proj.grid.mat$y,
+          ( spatial.effect.corre12), 
+           axes=TRUE, xlab=("Longitude"), ylab="Latitude"  ,
+           col= tim.colors(100), horizontal = T) #, zlim=c(-15,15))#,
+          # breaks = breaks)
+plot(europe, add=TRUE,col="bisque4")
+title("Spatial effect Anxovies (coregionalized w2|1+w2)")
+box()
+
+image.plot(proj.grid.mat$x, 
+           proj.grid.mat$y,
+          ( spatial.effect.corre), 
+           axes=TRUE, xlab=("Longitude"), ylab="Latitude"  ,
+           col= tim.colors(100), horizontal = T) #, zlim=c(-15,15))#,
+          # breaks = breaks)
+plot(europe, add=TRUE,col="bisque4")
+title("Spatial effect Anxovies (coregionalized w2)")
+box()
+
+
+hist(spatial.effect.corre-spatial.effect, main="", xlab="Spatial effect differences (Correg.-univar.)")
+```
+
+
+### Searching Spatial effect differences
+
+```{r histogr-diff-spatial-effect-anchovies}
+hist((spatial.effect.corre-spatial.effect),main="Diferencia del efecto espacial", xlab="")
+
+
+image.plot(proj.grid.mat$x, 
+           proj.grid.mat$y,
+          ( spatial.effect.corre12-spatial.effect), 
+           axes=TRUE, xlab=("Longitude"), ylab="Latitude"  ,
+           col= tim.colors(100), horizontal = T) #, zlim=c(-15,15))#,
+          # breaks = breaks)
+plot(europe, add=TRUE,col="bisque4")
+title("Difference: spatial effect Anxovies (w2|1+w2 - w_univar.)")
+box()
+
+```
+
+
+
+
+
+### Prediction Plot
+```{r plot-pred-corre-anchovies}
+#idx <- inla.stack.index(stack_all, 'pred.y3')$data  
+idx.y2 <- inla.stack.index(stack_all, 'pred.y2.corre')$data  
+idx.y1 <- inla.stack.index(stack_all, 'pred.y1.corre')$data  
+
+
+prob.mean.y2 <- prob.sd.y2 <- prob.0.025.y2<- prob.0.975.y2 <- matrix(NA, proj.grid.mat$lattice$dims[1],
+                                                          proj.grid.mat$lattice$dims[2])
+prob.mean.y2[!i.map] <- (c(pred_corre_2012_2017$summary.fitted.val$mean[idx.y2]))
+
+puntos<-which(prob.mean.y2[!i.map]>max((y2)))
+
+prob.sd.y2[!i.map] <- c(pred_corre_2012_2017$summary.fitted.val$sd[idx.y2])
+prob.0.025.y2[!i.map] <- c(pred_corre_2012_2017$summary.fitted.val$`0.025quant`[idx.y2])
+prob.0.975.y2[!i.map] <- c(pred_corre_2012_2017$summary.fitted.val$`0.975quant`[idx.y2])
+
+
+
+
+prob.mean.y1 <- prob.sd.y1 <- prob.0.025.y1<- prob.0.975.y1 <- matrix(NA, proj.grid.mat$lattice$dims[1],
+                                                          proj.grid.mat$lattice$dims[2])
+
+
+prob.mean.y1[!i.map] <- (c(pred_corre_2012_2017$summary.fitted.val$mean[idx.y1]))
+puntos<-which(prob.mean.y1>max(y1))
+
+prob.mean.y1[!i.map]<-ifelse(prob.mean.y1[!i.map]>1.25*max(y1), max(y1), prob.mean.y1[!i.map])
+
+
+prob.sd.y1[!i.map] <- c(pred_corre_2012_2017$summary.fitted.val$sd[idx.y1])
+prob.0.025.y1[!i.map] <- c(pred_corre_2012_2017$summary.fitted.val$`0.025quant`[idx.y1])
+prob.0.975.y1[!i.map] <- c(pred_corre_2012_2017$summary.fitted.val$`0.975quant`[idx.y1])
+
+
+
+library(RColorBrewer)
+
+rf <- colorRampPalette(rev(brewer.pal(11,'Spectral')))   # make colors
+colores1 <- rf(10) #rf(length(breaks1)-1)
+
+maximo<- 12 #max(prob.mean.y2, na.rm=T)
+minimo<-(-5) #min(prob.mean.y2, na.rm=T)
+particion<-maximo/2000
+
+image.plot(proj.grid.mat$x, 
+           proj.grid.mat$y,
+          log( prob.mean.y2), 
+           axes=TRUE, xlab=("Longitude"), ylab="Latitude"  ,
+           col=tim.colors(2000), horizontal = T, zlim=c(minimo,maximo))
+          # breaks = seq(minimo, maximo , particion))
+plot(europe, add=TRUE,col="bisque4")
+title(" Anchovies | hake (corregionalisation)")
+box()
+
+maximo<- 12 #max(prob.mean.y2, na.rm=T)
+minimo<-(-5) #min(prob.mean.y2, na.rm=T)
+particion<-maximo/2000
+
+image.plot(proj.grid.mat$x, 
+           proj.grid.mat$y,
+          log( prob.mean.y2)-log(prediction.anchovies.univariate), 
+           axes=TRUE, xlab=("Longitude"), ylab="Latitude"  ,
+           col=tim.colors(2000), horizontal = T, zlim=c(-1.5,2.5))
+          # breaks = seq(minimo, maximo , particion))
+plot(europe, add=TRUE,col="bisque4")
+title(" Difference prediction (mean)  coreg. - univariate (log scale)")
+box()
+
+
+
+maximo<- 10 #max(log(prob.mean.y1), na.rm=T)
+minimo<- (-3) # min(prob.mean.y1, na.rm=T)
+particion<-maximo/2000
+
+image.plot(proj.grid.mat$x, 
+           proj.grid.mat$y,
+         log ( prob.mean.y1), 
+           axes=TRUE, xlab=("Longitude"), ylab="Latitude"  ,
+           col=tim.colors(2000), horizontal = T, zlim=c(minimo,maximo))#,
+        #   breaks = seq(minimo, maximo , particion))
+plot(europe, add=TRUE,col="bisque4")
+title(" Hake (coregionalisation)")
+box()
+```
+
+# Spatio-temporal Anchovies|Hake
+
+$$y_1(s,t)=\beta_0^1+ \beta_1^1 \times Bathy + z_1(s,t)+ e_1(s,t)$$
+$$y_2(s,t)= \beta_0^2+ \beta_1^2 \times Bathy + \alpha_{2|1} z_1(s,t) + z_2(s,t)+ e_2(s,t)$$
+
+## From 2000 since 2015
+
+```{r inference-st-1-anchovies, eval=TRUE}
+
+
+sele<-(data3$abun.hake2>=0  &  
+         (data3$abun.anxova2>=0 ) & 
+           data3$year>=2000 & data3$year<=2015 )
+
+#data2010<-data3[data3$year>=2000,]
+data2010<-data3[sele,]
+
+y1<-data3$abun.hake2[sele ]+10
+y2<-data3$abun.anxova2[sele ]+10
+
+# y1<-data3$abun.hake[sele ]+0.001
+# y2<-data3$abun.anxova[sele ]+0.001
+
+range2006= result_corre2000$summary.hyperpar[3,3]
+stdev2006=result_corre2000$summary.hyperpar[4,5]
+
+spde_st1  <- inla.spde2.pcmatern(mesh = mesh_xavi, 
+                                  prior.range = c(0.05, 0.025), # P(range < range0) = 0.025
+                                  prior.sigma = c(10, 0.025),
+                                 constr = T) # P(sigma > sigma0) = 0.025
+
+
+
+# Indices for the space-time fields and for the copies need to be defined as well. As the same mesh is considered in all effects, these indices are the same for all the effects:
+
+#years
+k<-length(unique(data3$year[sele ]))
+
+s1 <- rep(1:spde_st1$n.spde, times = k)
+s2 <- s1
+s12 <- s1
+#s13 <- s1
+#s23 <- s1
+
+
+g1 <-   rep(1:k, each = spde_st1$n.spde)
+g2 <- g1
+g3<-g1
+g12 <- g1
+#g13 <- g1
+#g23<- g1
+
+# The prior on  rho_j   is chosen as a Penalized Complexity prior (Simpson et al. 2017) as well:
+
+rho1p <- list(theta = list(prior = 'pccor1', param = c(0.3, 0.9))) 
+ctr.g <- list(model = 'ar1', hyper = rho1p)
+
+# The prior above is chosen to consider  P(rho_j>0)=0.9
+#Priors for each of the copy parameters are Gaussian with zero mean and precision 10:
+
+hc1 <- list(theta = list(prior = 'normal', param = c(0, 10)))
+
+# The formula, which includes all the terms in the model and the priors previously defined, is:
+
+form <- y ~ -1 + intercept1 + intercept2 + # intercept3+ 
+  + batimetria1+ batimetria2+ #batimetria3+
+  f(s1, model = spde_st1, group = g1, control.group = ctr.g) + 
+  f(s2, model = spde_st1, group = g2, control.group = ctr.g) + 
+  f(s12, copy = "s1", group = g12, fixed = FALSE, hyper = hc1) #+
+
+
+X<-data3$lon[sele ]
+Y<-data3$lat[sele ]
+#loc3<-cbind(X,Y)
+loc2<-cbind(X,Y)
+loc1<-cbind(X,Y)
+
+
+# x1<-x2<-x3<-scale(data3$Bathymetry, scale=F)
+ x1<-x2<-(data3$Bathymetry[sele ])
+# # 
+ loc<-as.matrix(cbind(data3[sele,2:3]))## different sampling points, and this is a problem!!
+ 
+
+# #  #create groups i groups.n 
+index<-as.vector(table(data3$year[sele]))
+
+ groups.years<-matrix(NA, ncol=1)
+ group.n.years<-matrix(NA, ncol=1)
+jj<-0
+for (i in 1:k){
+  jj<-jj+1
+  kk<-matrix(rep(i,  index[i]), ncol=1)
+  groups.years<-rbind(groups.years,kk)
+  group.n.years<-rbind(group.n.years, matrix( 1:index[i],ncol=1))
+}
+groups.years<-as.vector(groups.years[-1,])
+group.n.years<-as.vector(group.n.years[-1,])
+
+#stloc<-kronecker(matrix(1,k,1), loc)
+
+## create a A matrix with groups  x year.
+A <- inla.spde.make.A(mesh_xavi, loc,
+                      n.group = k,
+                      group =groups.years)
+# 
+# # 
+# # # INDEX juve/adult
+mesh.index.hake<- inla.spde.make.index("i.hake",
+                                      n.spde=spde_st1$n.spde,
+                                      n.group=k)
+
+
+
+mesh.index.anxova<- inla.spde.make.index("i.anxova",
+                                      n.spde=spde_st1$n.spde,
+                                      n.group=k)
+
+
+#Then data are organized in three data stacks, which are joined:
+
+# ################# include Bathy
+
+stack1 <- inla.stack(
+  data = list(y = cbind(y1, NA)),
+  A = list(A,1), 
+  effects = list(list(s1 = s1, g1 = g1),list(data.frame(intercept1= 1,batimetria1=x1))),
+  tag='est.st.y1') 
+
+
+stack2 <- inla.stack(
+  data = list(y = cbind(NA, y2)),
+  A = list(A,1), 
+  effects = list(list( s2 = s2, g2 = g2, 
+    s12 = s12, g12 = g12),list(data.frame(intercept2 = 1, batimetria2=x2))), tag='est.st.y2') 
+
+
+stack <- inla.stack(stack1, stack2)#, stack3) 
+
+#estimate_corre_st_1<-readRDS( "estimate_corre_st_1.RDS")
+
+#moda = list(theta =result_corre2000$mode$theta, restart = TRUE)
+
+ estimate_corre_st_1 <- inla(form, rep('gamma', 2),  # 'gaussian' #'lognormal'
+                             data = inla.stack.data(stack),
+                      #  control.mode = moda,
+                       control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,    config = TRUE),
+                        control.results = list(return.marginals.predictor = FALSE,
+                                               return.marginals.random = FALSE),
+                     # control.mode = list(theta = theta.ini, restart = TRUE),
+                      control.inla = list(strategy="gaussian",int.strategy = 'eb'),
+                  control.predictor = list(A = inla.stack.A(stack),
+                                           compute = TRUE,link=1),
+                     num.threads =4)
+
+ saveRDS(estimate_corre_st_1, file="estimate_corre_st_1.RDS")
+estimate_corre_st_1<-readRDS( "estimate_corre_st_1.RDS")
+
+
+#summary(estimate_corre_st_1)
+
+
+knitr::kable(estimate_corre_st_1$summary.fixed[,1:5],
+  row.names = TRUE,
+  caption = "Posterior distribution for Fixed Effects (spatio-temporal Anchovies Coregionalization 2000-2017).",
+   format = "pandoc")
+
+knitr::kable(estimate_corre_st_1$summary.hyperpar[,1:5], digits=3,
+  row.names = TRUE,
+  caption = "Posterior distributions of the parameters of the spatio-temporal fields (spatio-temporal Anchovies Coregionalization 2000-2017).",
+   format = "pandoc")
+
+
+knitr::kable(estimate_corre_st_1$summary.fixed[,1:5],digits=5,
+  row.names = TRUE,
+  caption = "Posterior distribution for Fixed Effects (spatio-temporal Anchovies Coregionalization 2000-2017).",
+   format = "latex", booktabs=TRUE)
+
+knitr::kable(estimate_corre_st_1$summary.hyperpar[,1:5], digits=5,
+  row.names = TRUE,
+  caption = "Posterior distributions of the parameters of the spatio-temporal fields (spatio-temporal Anchovies Coregionalization 2000-2017).",
+   format = "latex", booktabs=TRUE)
+
+
+
+```
+
+```{r predict-map-st-anchovies-hake, eval=TRUE}
+require(INLA)
+
+estimate_corre_st_1_anchovies <- readRDS("estimate_corre_st_1.RDS")
+
+anchovies_corre = inla.posterior.sample(n=1000,estimate_corre_st_1_anchovies)
+contents_anchovies=estimate_corre_st_1_anchovies$misc$configs$contents
+
+save(anchovies_corre,file=paste0("","anchovies_corre.Rdata"))
+save(contents_anchovies,file=paste0("","contents_anchovies.Rdata"))
+
+
+
+
+
+# # ################################################
+# # ################ SOLEA PREDICTION # ################# ################
+# # ################################# ################# ################
+
+load(file=paste0("","anchovies_corre.Rdata"))
+load(file=paste0("","contents_anchovies.Rdata"))
+
+mesh=readRDS(file=paste0("","mesh_xavi.RDS"))
+bathy_mesh = readRDS(file=paste0("","bathy_into_mesh_points.RDS"))
+
+post_sample <- anchovies_corre
+contents=contents_anchovies
+
+# # ################################
+# # ################ abundance 1 # ################
+# # ################################
+
+# # ################ b0
+idx_intercept1=which(contents$tag=="intercept1")
+idx_intercept1=contents$start[idx_intercept1]:(contents$start[idx_intercept1]+contents$length[idx_intercept1]-1)
+intercept1=lapply(post_sample,function(x)x$latent[idx_intercept1])
+intercept1=matrix(unlist(intercept1),ncol=1,byrow=T)
+# # ################# batimetria1
+idx_batimetria1=which(contents$tag=="batimetria1")
+idx_batimetria1=contents$start[idx_batimetria1]:(contents$start[idx_batimetria1]+contents$length[idx_batimetria1]-1)
+batimetria1 = lapply(post_sample, function(x) x$latent[idx_batimetria1])
+batimetria1 = matrix(unlist(batimetria1), ncol = length(idx_batimetria1), byrow = T)
+# # ################# s1
+idx_s1=which(contents$tag=="s1")
+idx_s1=contents$start[idx_s1]:(contents$start[idx_s1]+contents$length[idx_s1]-1)
+s1 = lapply(post_sample, function(x) x$latent[idx_s1])
+s1 = matrix(unlist(s1), ncol = length(idx_s1), byrow = T)
+
+mesh_bathy=rep(bathy_mesh,ncol(s1)/mesh$n)
+
+# # ################ temporal trend # #################
+predict_samples_1=list()
+for(i in 1:ncol(s1)){
+  predict_samples_1[[i]]=exp(intercept1 + s1[,i] + batimetria1*mesh_bathy[i])
+}
+
+mean_1=unlist(lapply(predict_samples_1,FUN=median, na.rm=T))
+q025_1=unlist(lapply(predict_samples_1,FUN=function(x){quantile(x,probs=.025,na.rm=T)}))
+q975_1=unlist(lapply(predict_samples_1,FUN=function(x){quantile(x,probs=.975,na.rm=T)}))
+
+abundance_1=data.frame(mean_1,q025_1,q975_1,
+                       x=rep(mesh$loc[,1],ncol(s1)/mesh$n),
+                       y=rep(mesh$loc[,2],ncol(s1)/mesh$n),
+                       t=rep(2000:(1999+(ncol(s1)/mesh$n)),each=mesh$n))
+
+library(ggplot2)
+##de momento no printes
+# ggplot(abundance_1[abundance_1$t>2011,])+
+#   geom_point(aes(x=x,y=y,color=mean_1),size=1)+
+#   facet_wrap(~t)+
+#   ggtitle("Hake coregionaized spatio-temporal")
+
+# # ################################
+# # ################ abundance 2 # ################
+# # #################################
+
+# # ################ b0
+idx_intercept2=which(contents$tag=="intercept2")
+idx_intercept2=contents$start[idx_intercept2]:(contents$start[idx_intercept2]+contents$length[idx_intercept2]-1)
+intercept2=lapply(post_sample,function(x)x$latent[idx_intercept2])
+intercept2=matrix(unlist(intercept2),ncol=1,byrow=T)
+# # --# --# --# --- batimetria2
+idx_batimetria2=which(contents$tag=="batimetria2")
+idx_batimetria2=contents$start[idx_batimetria2]:(contents$start[idx_batimetria2]+contents$length[idx_batimetria2]-1)
+batimetria2 = lapply(post_sample, function(x) x$latent[idx_batimetria2])
+batimetria2 = matrix(unlist(batimetria2), ncol = length(idx_batimetria2), byrow = T)
+# # ################ s2
+idx_s2=which(contents$tag=="s2")
+idx_s2=contents$start[idx_s2]:(contents$start[idx_s2]+contents$length[idx_s2]-1)
+s2 = lapply(post_sample, function(x) x$latent[idx_s2])
+s2 = matrix(unlist(s2), ncol = length(idx_s2), byrow = T)
+# # ################ s12
+idx_s12=which(contents$tag=="s12")
+idx_s12=contents$start[idx_s12]:(contents$start[idx_s12]+contents$length[idx_s12]-1)
+s12 = lapply(post_sample, function(x) x$latent[idx_s12])
+s12 = matrix(unlist(s12), ncol = length(idx_s12), byrow = T)
+
+# # ################ temporal trend # ################
+predict_samples_2=list()
+for(i in 1:ncol(s2)){
+  predict_samples_2[[i]]=exp(intercept2 + s2[,i]  + s12[,i] + batimetria2*mesh_bathy[i])
+}
+
+mean_2=unlist(lapply(predict_samples_2,FUN=median,na.rm=T))
+q025_2=unlist(lapply(predict_samples_2,FUN=function(x){quantile(x,probs=.025,na.rm=T)}))
+q975_2=unlist(lapply(predict_samples_2,FUN=function(x){quantile(x,probs=.975,na.rm=T)}))
+
+abundance_2=data.frame(mean_2,q025_2,q975_2,
+                       x=rep(mesh$loc[,1],ncol(s1)/mesh$n),
+                       y=rep(mesh$loc[,2],ncol(s1)/mesh$n),
+                       t=rep(2000:(1999+(ncol(s1)/mesh$n)),each=mesh$n))
+
+
+
+library(MBA)
+library(splancs)
+library(akima)
+npts<-1500
+
+xmin<-min(coast@polygons[[1]]@Polygons[[1]]@coords[,1])-0.11
+xmax<-max(coast@polygons[[1]]@Polygons[[1]]@coords[,1])+0.16
+x.pts<-seq(xmin,xmax, length=500)
+
+ymin<-min(coast@polygons[[1]]@Polygons[[1]]@coords[,2])-0.5
+ymax<-max(coast@polygons[[1]]@Polygons[[1]]@coords[,2])+0.5
+y.pts<-seq(ymin,ymax,length=500)
+
+z.pts<-expand.grid(x.pts,y.pts)
+colnames(z.pts)<-c("x","y")
+
+xy.in2<-inout(z.pts, 
+              coast@polygons[[1]]@Polygons[[1]]@coords,
+              bound=TRUE) 
+
+inside_points<-NULL
+data_inside_points<-NULL
+for(i in 2000:max(abundance_2$t)){
+  
+ npred<-length(abundance_2$mean_2[!is.na(abundance_2$mean_2) & abundance_2$t==i])
+xpred<-abundance_2$x[!is.na(abundance_2$mean_2) & abundance_2$t==i]
+ypred<-abundance_2$y[!is.na(abundance_2$mean_2) & abundance_2$t==i] 
+z<-abundance_2$mean_2[!is.na(abundance_2$mean_2) & abundance_2$t==i] 
+
+  superficie.anc_hake<-interp(x=xpred, y=ypred,
+                              z=z, 
+                              duplicate="median",
+                      xo=x.pts,
+                      yo=y.pts,
+                      extrap=TRUE, linear=FALSE)
+
+melt_x=rep(superficie.anc_hake$x, times=length(superficie.anc_hake$y))
+melt_y=rep(superficie.anc_hake$y, each=length(superficie.anc_hake$x))
+melt_z=as.vector(superficie.anc_hake$z)
+melt_z<-ifelse(melt_z<=0,7,melt_z)
+melt_z=log(melt_z)
+#melt_z<-ifelse(melt_z>1,1,melt_z)
+level_data = data.frame(longitude=melt_x, latitude=melt_y, Z.io=melt_z)
+interp_data = na.omit(level_data)
+grid_points = SpatialPoints(interp_data[,2:1])
+#in_points = !is.na(over(grid_points,chipre.shapefile))
+inside_points = interp_data[xy.in2, ]
+data_inside_points<-rbind(data_inside_points, data.frame(inside_points, t=i))
+
+}
+data_inside_points$t<-factor(data_inside_points$t)
+
+
+paleta<-colorRampPalette(c("grey","midnightblue"))
+colores<-paleta(6)
+paleta2<-colorRampPalette(c("green","brown"))
+colores2<-paleta2(6)
+
+
+ggplot(data=data_inside_points, aes(x=longitude, y=latitude, z=Z.io)) + 
+  #geom_tile(aes(fill=Z.io)) + 
+  geom_raster(aes(fill =Z.io))+
+  borders(colour="midnightblue", fill="bisque4") +
+ # coord_fixed(xlim = range(abundance_2$x),ylim=range(abundance_2$y))+
+  coord_fixed(xlim =c(-1.5,3.2),ylim=c(37,42))+
+    scale_fill_gradientn(colours=colores,na.value = "transparent",
+                       breaks=c(-4,-2,0,2,4,6,8, 11),
+                       labels=c(-3.5,-2,0,2,4,6,8,10),
+                       limits=c(-3.5,11))+
+  facet_wrap(~t)+
+  theme(legend.position="none")
+  
+
+
+```
+
+\pagebreak
+
+\newpage
+
+# Cross-validation
+
+## Error to  predict 2016
+
+```{r cross-validation-2016, eval=FALSE}
+###########################################
+######  Predecir 2017 univariante ###
+##########################################
+
+# funciona be 2011-2013
+# funciona 2003
+aa<-2000
+  bb<-2015
+
+for(iii in 2016:2016){
+  sele<-  data3$abun.anxova2>=0  &
+  data3$year>=aa &   data3$year<=bb & (data3$year!=iii) # | data3$year!=iii-1 | data3$year!=iii-2)
+
+data2010<-data3[sele,]
+
+#min(data2010$abun.anxova2[data2010$abun.anxova2>0])
+# 17.82389
+
+y2<-(data2010$abun.anxova2) + 9 #+1
+
+batimetria3<-data2010$Bathymetry #scale(data2010$Bathymetry , scale=F) 
+batimetria2<-batimetria3
+
+spde_corre <- inla.spde2.pcmatern(mesh = mesh_xavi, 
+                                  prior.range = c(0.05, 0.025), # P(range < 0.05) = 0.01
+                                  prior.sigma = c(10, 0.025),
+                                  constr = F) # P(sigma > 1) = 0.01
+
+X<-data2010$lon
+Y<-data2010$lat
+
+loc2<-cbind(X,Y)
+
+## # --# --pcopy# ################################---
+hyper <- list(theta = list(prior = 'normal', param = c(0, 5)))
+#hyper1 = list(theta = list(prior="pc.prec", param=c(1,0.01)))
+
+## # --# --form# ################################--# --
+form <- y ~ 0 + intercept2 + 
+  # f(batimetria2, model="rw1", constr=TRUE)+
+  batimetria2+
+  f(s2, model = spde_corre) 
+## --# --# ---
+
+A <- inla.spde.make.A(mesh_xavi, loc2) 
+
+stack2 <- inla.stack(
+  data = list(y =  as.vector(y2), link=1),
+  A = list(A,1), 
+  effects = list(list(s2 = 1:spde_corre$n.spde,
+                      s12 = 1:spde_corre$n.spde),
+                 data.frame(intercept2 = 1, batimetria2=batimetria2)),
+  tag="est.anxova.uni")
+
+result_uni2000_2016<- inla(form, 'gamma',  # 'gaussian' #'lognormal'
+                      data = inla.stack.data(stack2),
+                      control.family = list(link = "log"),
+                      #  control.family = list(hyper.eps, hyper.eps),
+                      # control.family=list(list(link="logit"),list(link="logit")),
+                      control.predictor = list(A = inla.stack.A(stack2),
+                                               compute = TRUE,link=1),
+                      #    control.mode = list(theta =result_corre2010$mode$theta, restart = TRUE),
+                      control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,    config = TRUE),
+                      
+                      control.results = list(return.marginals.predictor = FALSE,
+                                             return.marginals.random = FALSE),
+                      control.inla = list(strategy='gaussian', int.strategy = 'ccd'),
+                      num.threads = 3,
+                      verbose=FALSE)
+
+
+####
+sele2017<-data3$abun.anxova2>=0  &   data3$year==2017
+sele2017<-data3$abun.anxova2>=0  &  (data3$year==iii) #  | data3$year==iii-11 | data3$year==iii-2)
+
+
+A2.pred <- inla.spde.make.A(mesh_xavi, loc=cbind(data3$lon[sele2017], data3$lat[sele2017]))
+
+bathy.pred<- data3[sele2017,"Bathymetry" ]
+
+
+
+#bathy.pred2<-raster::extract(predictors2$Bathymetry, mesh_xavi$loc[, 1:2])
+
+nY<- length(bathy.pred)
+
+stk.pred.2 <- inla.stack(data=list(y=matrix(NA, ncol=1, nrow=nY), link=2), 
+                         #  ,, 
+                         A=list(A2.pred,1), 
+                         effects = list(list(s2 = 1:spde_corre$n.spde,
+                                             s12 = 1:spde_corre$n.spde),
+                                        data.frame(intercept2=rep(1,nY), 
+                                                   batimetria2=bathy.pred)),
+                         tag='pred.y2.uni')
+
+stack_all.pred <- inla.stack( stack2,# stack3,  
+                              stk.pred.2)#, stk.pred.3) 
+
+pred_univariate_2017<- inla(form, 'gamma',  # 'gaussian' #'lognormal'
+                                 data = inla.stack.data(stack_all.pred),
+                                 control.family = list(link = "log"),
+                                 #  control.family = list(hyper.eps, hyper.eps),
+                                 # control.family=list(list(link="logit"),list(link="logit")),
+                                 control.predictor = list(A = inla.stack.A(stack_all.pred),
+                                                          compute = TRUE,link=1),
+                              #   control.mode = list(theta =result_uni2000$mode$theta, restart = TRUE),
+                                 #   control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,    config = TRUE),
+                                 
+                                 control.results = list(return.marginals.predictor = FALSE,
+                                                        return.marginals.random = FALSE),
+                                 control.inla = list(strategy='gaussian',int.strategy = 'ccd'),
+                                 num.threads = 3,
+                                 verbose=FALSE)
+
+
+y2.pred.uni<-data3$abun.anxova2[sele2017]+9
+idx.y2.uni <- inla.stack.index(stack_all.pred, 'pred.y2.uni')$data  
+
+predichos_uni<-pred_univariate_2017$summary.fitted.values$mean[idx.y2.uni]
+
+diff1.uni<-(y2.pred.uni-predichos_uni)
+diff2.uni<-(log(y2.pred.uni)-pred_univariate_2017$summary.linear.predictor$mean[idx.y2.uni])
+
+
+
+###########################################
+######  Predict 2017 coregionalized ###
+##########################################
+sele1<-data3$abun.hake2>=0 &  
+  data3$year>=aa &   data3$year<=bb & (data3$year!=iii) # | data3$year!=iii-1 | data3$year!=iii-2)
+
+sele2<-data3$abun.anxova2>=0  &
+  data3$year>=aa &   data3$year<=bb  & (data3$year!=iii) # | data3$year!=iii-1 | data3$year!=iii-2)
+
+data2010<-data3[sele,]
+
+y1<-(data3[sele1,"abun.hake2"]+4) 
+y2<-(data3[sele2,"abun.anxova2"]+9) 
+
+batimetria2<- data3[sele2,"Bathymetry" ]
+batimetria1<-data3[sele1,"Bathymetry" ]
+
+
+loc2<-cbind(data3$lon[sele2], data3$lat[sele2])
+loc1<-cbind(data3$lon[sele1], data3$lat[sele1])
+
+## # --# --pcopy# ################################---
+#hyper <- list(theta = list(prior = 'normal', param = c(0, 5)))
+hyper1 = list(theta = list(prior="pc.prec", param=c(1,0.01)))
+
+## # --# --form# ################################--# --
+form <- y ~ 0 + intercept1 + intercept2 + 
+  # f(batimetria1, model="rw1")+f(batimetria2, model="rw1")+
+  batimetria1+batimetria2+
+  f(s1, model = spde_corre) + f(s2, model = spde_corre) + 
+  f(s12, copy = "s1", fixed = FALSE, hyper = hyper) 
+
+
+
+## --# --# ---
+
+A1 <- inla.spde.make.A(mesh_xavi, loc1)  # abun.hake>0
+A2 <- inla.spde.make.A(mesh_xavi, loc2)  # abun.anchovies>0
+
+
+stack2 <- inla.stack(
+  data = list(y = cbind(NA, as.vector(y2)), link=2),
+  A = list(A2,1), 
+  effects = list(list(s2 = 1:spde_corre$n.spde,
+                      s12 = 1:spde_corre$n.spde),
+                 data.frame(intercept2 = 1, batimetria2=batimetria2)),
+  tag="est.anxova.corre")
+
+stack1 <- inla.stack(
+  data = list(y = cbind(as.vector(y1), NA), link=1),
+  A = list(A1,1), 
+  effects = list(list(s1 = 1:spde_corre$n.spde),
+                 data.frame(intercept1 = 1, batimetria1=batimetria1)),
+  tag="est.hake.corre")
+
+
+stack <- inla.stack(stack1, stack2) 
+
+## --# --result, results = 'hide'# ################################# --# --
+
+
+result_corre2000_2016<- inla(form, c(rep('gamma', 2)),  # 'gaussian' #'lognormal'
+                        data = inla.stack.data(stack),
+                        control.family = list(list(link = "log"),
+                                              list(link = "log")),
+
+                        control.predictor = list(A = inla.stack.A(stack),
+                                                 compute = TRUE,link=1),
+                        #    control.mode = list(theta =result_corre2010$mode$theta, restart = TRUE),
+                        control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,    config = TRUE),
+
+                        control.results = list(return.marginals.predictor = FALSE,
+                                               return.marginals.random = FALSE),
+                        control.inla = list(
+                          strategy='gaussian',
+                          int.strategy = 'ccd'),
+                        num.threads = 3,
+                        verbose=FALSE)
+
+
+
+####### a predecir Corregionalizado
+
+sele2017<-data3$abun.anxova2>=0  &   data3$year==2017
+sele2017<-data3$abun.anxova2>=0  &   (data3$year==iii) # | data3$year==iii-1 | data3$year==iii-2)
+
+
+A1.pred <- inla.spde.make.A(mesh_xavi, loc=cbind(data3$lon[sele2017], data3$lat[sele2017]))
+A2.pred <- inla.spde.make.A(mesh_xavi, loc=cbind(data3$lon[sele2017], data3$lat[sele2017]))
+
+bathy.pred<- data3[sele2017,"Bathymetry" ]
+
+
+#bathy.pred2<-raster::extract(predictors2$Bathymetry, mesh_xavi$loc[, 1:2])
+
+nY<- length(bathy.pred)
+
+stk.pred.1 <- inla.stack(data=list(y=matrix(NA, ncol=2, nrow=nY ), link=1), 
+                         A=list(A1.pred,1), 
+                         effects = list(list(s1 = 1:spde_corre$n.spde),
+                                        data.frame(intercept1=rep(1,nY), batimetria2=bathy.pred)),
+                         tag='pred.y1.corre')
+
+stk.pred.2 <- inla.stack(data=list(y=matrix(NA, ncol=2, nrow=nY), link=2), 
+                         #  ,, 
+                         A=list(A2.pred,1), 
+                         effects = list(list(s2 = 1:spde_corre$n.spde,
+                                             s12 = 1:spde_corre$n.spde),
+                                        data.frame(intercept2=rep(1,nY), batimetria2=bathy.pred)),
+                         tag='pred.y2.corre')
+
+
+
+
+stack_all.pred <- inla.stack(stack1, stack2,# stack3,  
+                        stk.pred.1, stk.pred.2)#, stk.pred.3) 
+
+pred_corre_2017<- inla(form, c(rep('gamma', 2)),  # 'gaussian' #'lognormal'
+                            data = inla.stack.data(stack_all),
+                            control.family = list(list(link = "log"),
+                                                  list(link = "log")),
+                            #  control.family = list(hyper.eps, hyper.eps),
+                            # control.family=list(list(link="logit"),list(link="logit")),
+                            control.predictor = list(A = inla.stack.A(stack_all),
+                                                     compute = TRUE,link=1),
+                           # control.mode = list(theta =result_corre2000_2016$mode$theta, restart = TRUE),
+                            #   control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,    config = TRUE),
+                            control.results = list(return.marginals.predictor = FALSE,
+                                                   return.marginals.random = FALSE),
+                            control.inla = list(
+                              strategy='gaussian',
+                              int.strategy = 'ccd'),
+                            #  strategy='gaussian',
+                            # int.strategy = 'eb'),
+                            # num.threads = 3,
+                            verbose=FALSE)
+
+
+idx.y2 <- inla.stack.index(stack_all.pred, 'pred.y2.corre')$data  
+
+y1.pred<-(data3[sele2017,"abun.hake2"]+4) 
+y2.pred<-(data3[sele2017,"abun.anxova2"]+9) 
+
+predichos_corre<-pred_corre_2017$summary.fitted.values$mean[idx.y2]
+
+diff2.corre<-(log(y2.pred)-(pred_corre_2017$summary.linear.predictor$mean[idx.y2]))
+diff1.corre<-((y2.pred)-(pred_corre_2017$summary.fitted.values$mean[idx.y2]))
+
+
+
+
+###### a calcular el MAE, RSME, etc
+print("######-----------------------#######")
+print(paste("####### Year:", iii, "#######"))
+
+RMSE <- function(error) { sqrt(mean(error^2)) }
+print(paste("RMSE uni:",RMSE(diff1.uni)))
+print(paste("RMSE corre:",RMSE(diff1.corre)))
+
+
+
+# If you want, say, MAE, you can do the following:
+
+# Function for Mean Absolute Error
+mae <- function(error) { mean(abs(error)) }
+print(paste("MAE uni:",mae(diff1.uni)))
+print(paste("MAE corre:",mae(diff1.corre)))
+}
+
+  
+
+```
+
+```
+[1] "######-----------------------#######"
+[1] "####### Year: 2016 #######"
+[1] "RMSE uni: 8422.54620655047"
+[1] "RMSE corre: 7697.88619465212"
+[1] "MAE uni: 4212.35713127933"
+[1] "MAE corre: 3842.35704981238"
+```
+
+
